@@ -1,5 +1,6 @@
 import mysql from 'mysql2/promise';
 import dotenv from 'dotenv';
+
 dotenv.config();
 
 const pool = mysql.createPool({
@@ -8,9 +9,15 @@ const pool = mysql.createPool({
   user: process.env.DB_USER || 'root',
   password: process.env.DB_PASSWORD || '',
   database: process.env.DB_NAME || 'nexora_bank',
+
+  ssl: ['localhost', '127.0.0.1'].includes(process.env.DB_HOST)
+    ? undefined
+    : { minVersion: 'TLSv1.2' },
+
   waitForConnections: true,
   connectionLimit: 10,
   decimalNumbers: true,
   dateStrings: true
 });
+
 export default pool;
