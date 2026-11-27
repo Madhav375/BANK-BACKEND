@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import crypto from 'crypto';
+import Razorpay from 'razorpay';
 
 import express from 'express';
 import cors from 'cors';
@@ -49,6 +51,138 @@ app.patch('/api/admin/employees/:id/status',requireAuth,requireAdmin,async(req,r
   await pool.execute('UPDATE users SET is_active=? WHERE user_id=?',[active,req.params.id]);res.json({ok:true});
 });
 app.use('/api',requireAuth);
+const razorpay = process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET
+  ? new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    })
+  : null;
+  // 1. Create a Razorpay order for an online deposit
+app.post('/api/payments/create-order', async (req, res) => {
+  if (!razorpay) return res.status(503).json({ error: 'Razorpay is not configured on the server.' });
+
+  const { account_number, amount } = req.body || {};
+  const value = Number(amount);
+
+  // Razorpay requires a minimum of ₹1.00 (100 paise)
+  if (!account_number || !Number.isFinite(value) || value < 1) {
+    return res.status(400).json({ error: 'Enter a valid account and amount (minimum ₹1).' });
+  }
+
+  try {
+    const [[account]] = await pool.query(
+      'SELECT account_number, status FROM accounts WHERE account_number = ?',
+      [Number(account_number)]
+    );
+    if (!account || account.status !== 'Active') {
+      return res.status(400).json({ error: 'Target account is inactive or does not exist.' });
+    }
+
+    const amountPaise = Math.round(value * 100);
+    const rzpOrder = await razorpay.orders.create({
+      amount: amountPaise,
+      currency: 'INR',
+      receipt: `nxr_${account.account_number}_${Date.now()}`.slice(0, 40),
+    });
+
+    await pool.execute(
+      'INSERT INTO payment_orders(razorpay_order_id, account_number, amount, status, created_by) VALUES(?,?,?,?,?)',
+      [rzpOrder.id, account.account_number, value, 'Created', req.user.id]
+    );
+
+    res.status(201).json({
+      keyId: process.env.RAZORPAY_KEY_ID,
+      orderId: rzpOrder.id,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Could not initialize Razorpay order.' });
+  }
+});
+
+// 2. Verify HMAC-SHA256 signature & credit the account inside an ACID transaction
+app.post('/api/payments/verify', async (req, res) => {
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body || {};
+  if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+    return res.status(400).json({ error: 'Missing payment verification details.' });
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Lock the order row so concurrent requests cannot double-credit
+    const [[order]] = await conn.query(
+      'SELECT * FROM payment_orders WHERE razorpay_order_id = ? FOR UPDATE',
+      [razorpay_order_id]
+    );
+    if (!order) throw new Error('Payment order not found.');
+    if (order.status === 'Paid') throw new Error('This payment has already been processed.');
+
+    // Verify signature using the order_id stored in our DB (not trusting client blindly)
+    const expected = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(`${order.razorpay_order_id}|${razorpay_payment_id}`)
+      .digest('hex');
+
+    const isValid =
+      expected.length === razorpay_signature.length &&
+      crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(razorpay_signature));
+
+    if (!isValid) {
+      await conn.execute('UPDATE payment_orders SET status = ? WHERE order_id = ?', ['Failed', order.order_id]);
+      await conn.commit();
+      return res.status(400).json({ error: 'Invalid payment signature.' });
+    }
+
+    // Lock the target account and credit the balance
+    const [[account]] = await conn.query(
+      'SELECT * FROM accounts WHERE account_number = ? FOR UPDATE',
+      [order.account_number]
+    );
+    if (!account || account.status !== 'Active') {
+      throw new Error('Target account is inactive or missing.');
+    }
+
+    const oldBalance = Number(account.balance);
+    const depositAmount = Number(order.amount);
+    const newBalance = oldBalance + depositAmount;
+
+    await conn.execute('UPDATE accounts SET balance = ? WHERE account_number = ?', [newBalance, account.account_number]);
+    await conn.execute(
+      'INSERT INTO audit_logs(account_number, action, old_balance, new_balance) VALUES(?,?,?,?)',
+      [account.account_number, 'RAZORPAY_DEPOSIT', oldBalance, newBalance]
+    );
+    const [txResult] = await conn.execute(
+      'INSERT INTO transactions(from_account, to_account, amount, transaction_type, status) VALUES(?,?,?,?,?)',
+      [null, account.account_number, depositAmount, 'Deposit', 'Success']
+    );
+    await conn.execute(
+      'UPDATE payment_orders SET status = ?, razorpay_payment_id = ?, paid_at = NOW() WHERE order_id = ?',
+      ['Paid', razorpay_payment_id, order.order_id]
+    );
+
+    await conn.commit();
+
+    // Return the exact same payload shape as POST /api/transactions
+    const [[transaction]] = await pool.query(
+      "SELECT transaction_id,from_account,to_account,amount,transaction_type,status,DATE_FORMAT(transaction_date,'%d-%m-%Y %H:%i') AS date FROM transactions WHERE transaction_id=?",
+      [txResult.insertId]
+    );
+    const [accounts] = await pool.query('SELECT * FROM accounts ORDER BY account_number');
+    const [auditLogs] = await pool.query(
+      "SELECT log_id,account_number,action,old_balance,new_balance,DATE_FORMAT(created_at,'%d-%m-%Y %H:%i') AS date FROM audit_logs ORDER BY log_id DESC"
+    );
+
+    res.status(201).json({ transaction, accounts, auditLogs });
+  } catch (e) {
+    await conn.rollback();
+    res.status(400).json({ error: e.message });
+  } finally {
+    conn.release();
+  }
+});
 app.get('/api/data',async(_req,res)=>{
  try{
   const [[branches],[customers],[accounts],[loans],[transactions],[auditLogs]] = await Promise.all([
